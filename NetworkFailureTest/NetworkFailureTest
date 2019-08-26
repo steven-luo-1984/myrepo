@@ -1,0 +1,1025 @@
+#!/bin/bash
+
+PROGNAME=$(basename $0)
+PROGDIR=$(dirname $0)
+
+SCRIPTNAME=$PROGNAME
+
+SOURCEDIR=$(cd $PROGDIR/../../../.. && pwd)
+WORKDIR=$(cd $SOURCEDIR/.. && pwd)/workdir
+. $SOURCEDIR/kvstore/test/scripts/testutil
+
+declare -a ALLHOSTS
+
+CONFIG=
+EXTRA_CONFIG=
+IVY_USER=
+IVY_KEYFILE=
+IVY_KEYPASSWORD=
+FAILURE_CONFIG_OVERRIDE=
+FAILURE_CONFIG_OPTION=
+
+USAGE="Usage: $PROGNAME arguments...
+Arguments:
+  -java_home JAVA_HOME (optional)
+    The directory for JAVA_HOME
+  -pre_java_home PRE_JAVA_HOME (optional)
+    The directory for PRE_JAVA_HOME
+  -ant_home ANT_HOME (optional)
+    The directory for ANT_HOME
+  -test_hosts [host1[,hostX*]] (required)
+    A list of host names of test machines
+  -ivy_user IVY_USER (optional)
+    A ivy user name
+  -ivy_keyfile IVY_KEYFILE (optional)
+    A ivy key file path
+  -ivy_keypassword IVY_KEYPASSWORD (optional)
+    A ivy key password
+  -test_cases [1..19] (optional)
+    A list of running testcases
+  -work_dir WORKDIR (optional)
+    Work directory for the test
+  -test_mode [kv|table|r2-compat] TEST_MODE (optional)
+    Set test mode
+  -secured (optional)
+    Set security mode and default is non-secured
+  -failure-config-override CONFIGFILE (optional)
+    Override for the failure config"
+
+# Print usage and exit
+function usage() {
+    echo "$USAGE" >&2
+    exit 1
+}
+
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        -java_home)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -java_home"
+            fi
+            export JAVA_HOME=$2; shift
+            shift;;
+        -pre_java_home)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -pre_java_home"
+            fi
+            export JDK8_HOME=$2; shift
+            shift;;
+        -ant_home)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -ant_home"
+            fi
+            export ANT_HOME=$2; shift
+            shift;;
+        -test_hosts)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -test_hosts"
+            fi
+            TEST_HOSTS=$2; shift
+            shift;;
+        -ivy_user)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -ivy_user"
+            fi
+            IVY_USER=$2; shift
+            shift;;
+        -ivy_keyfile)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -ivy_keyfile"
+            fi
+            IVY_KEYFILE=$2; shift
+            shift;;
+        -ivy_keypassword)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -ivy_keypassword"
+            fi
+            IVY_KEYPASSWORD=$2; shift
+            shift;;
+        -test_cases)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -test_cases"
+            fi
+            TEST_CASES=$2; shift
+            shift;;
+        -work_dir)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -work_dir"
+            fi
+            WORKDIR=$2; shift
+            shift;;
+        -test_mode)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -test_mode"
+            fi
+            DATACHECK_TEST_MODE=$2; shift
+            shift;;
+        -secured)
+           SECURITY=true
+           shift;;
+        -failure-config-override)
+            if [ "$2" = "" ]; then
+                echo "$SCRIPTNAME: Value missing for -failure-config-override"
+            fi
+            FAILURE_CONFIG_OVERRIDE=$2; shift
+            shift;;
+        *)
+            echo "$SCRIPTNAME: Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
+
+if [ "$JAVA_HOME" = "" ]; then
+    echo "No environment variable JAVA_HOME. Environment JAVA_HOME is required to set"
+    exit 1
+fi
+
+if [ "$ANT_HOME" = "" ]; then
+    echo "No environment variable ANT_HOME. Environment ANT_HOME is required to set"
+    exit 1
+fi
+
+export PATH=$JAVA_HOME/bin:$ANT_HOME/bin:$PATH
+
+SCRATCHDIR=$WORKDIR/scratch
+RESULTSDIR=$WORKDIR/results
+BACKUPDIR=$WORKDIR/backup
+DATACHECKDIR=$SOURCEDIR/kvstore/test/standalone/datacheck
+
+# JE eraser configuration
+ENABLE_JE_ERASER=${ENABLE_JE_ERASER:-"false"}
+if [ "$ENABLE_JE_ERASER" = "true" ]; then
+    EXTRA_JE_CONFIG="je.env.runEraser true;\
+je.erase.deletedDatabases true;\
+je.erase.extinctRecords true;\
+je.erase.period 10 minutes"
+fi
+
+# Parse the test machine names
+function parse_hosts_info() {
+    local hosts_info=$1
+    local -i number_hosts=0
+    while [ "$hosts_info" != "" ]; do
+        local host=$(echo $hosts_info | cut -d "," -f 1)
+        hosts_info=$(echo $hosts_info | cut -d "," -f 2- -s)
+        ALLHOSTS[$number_hosts]=$host
+        number_hosts=$((number_hosts+1))
+    done
+}
+
+# Clean test environment
+function clear_env() {
+    echo "Clear environment..."
+    rm -rf $SCRATCHDIR
+    rm -rf $RESULTSDIR
+
+    mkdir -p $SCRATCHDIR
+    mkdir -p $RESULTSDIR
+
+    for (( i=0; i < ${#ALLHOSTS[@]} ; i++ ))
+    do
+        local host=${ALLHOSTS[$i]}
+        echo "Clear $host"
+        ssh $host "$IPTABLES -F"
+        ssh $host "$IPTABLES -L"
+    done
+
+    echo "Clear localhost"
+    $IPTABLES -F
+    $IPTABLES -L
+}
+
+# Common config
+function common_config() {
+    CONFIG=$1
+    cat >> $CONFIG <<- EOF
+NPARTITIONS=1001
+JAVA=$JAVA_HOME/bin/java
+JAR=$WORKDIR/lib/kvstoretest.jar
+TESTJAR=$WORKDIR/lib/kvstoretest.jar
+
+MEMORY_MB=2048
+
+NB_CPUS=6
+#Test mode
+DATACHECK_TEST_MODE=$DATACHECK_TEST_MODE
+DATACHECK_COUNT=$COUNT
+
+DATACHECK_THREADS=$THREADS
+
+DATACHECK_CONSISTENCY="lag=10000,timeout=90000"
+DATACHECK_ARGS="-requestTimeout 360000 \\
+                -blockTimeout 720000 \\
+                -requestLimitConfig maxActiveRequests=2000,requestThresholdPercent=90,nodeLimitPercent=80"
+CONFIG_POLICY="configProperties=je.rep.replicaAckTimeout 100 s;\\
+               je.rep.txnRollbackLimit 100;\\
+               $EXTRA_JE_CONFIG"
+
+RN_POLICY="rnMaxActiveRequests=500\\
+           rnNodeLimitPercent=90\\
+           rnRequestThresholdPercent=95\\
+           rnHeapPercent=70"
+
+ADMIN_CONFIG="configProperties=je.rep.txnRollbackLimit 100"
+
+DATACHECK_TEST_MODE=$DATACHECK_TEST_MODE
+DATACHECK_INDEX_READ_PERCENT=$DATACHECK_INDEX_READ_PERCENT
+
+SECURITY=$SECURITY
+EOF
+}
+
+# Common extra config
+function common_extra_config() {
+    EXTRA_CONFIG=$1
+    cat >> $EXTRA_CONFIG <<- EOF
+JAVA=$JAVA_HOME/bin/java
+JAR=$WORKDIR/lib/kvstoretest.jar
+TESTJAR=$WORKDIR/lib/kvstoretest.jar
+MEMORY_MB=2048
+
+NB_CPUS=6
+DATACHECK_TEST_MODE=$DATACHECK_TEST_MODE
+DATACHECK_INDEX_READ_PERCENT=$DATACHECK_INDEX_READ_PERCENT
+
+SECURITY=$SECURITY
+EXTRA_STORAGE=true
+EOF
+}
+
+# Configure DCINFO for non-arbiter test and arbiter test
+function configure_dcinfo() {
+    local CONFIG=$1
+    local topo=$2
+    if [ "$topo" = "arbiter" ]; then
+        cat >> $CONFIG <<- EOF
+DCINFO="name=1;rf=2;allowArbiters=true"
+EOF
+    else
+        cat >> $CONFIG <<- EOF
+DCINFO="name=1;rf=3"
+EOF
+    fi
+}
+
+# Generate basic config
+function generate_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=3"
+
+NDATACENTERS=3
+
+DCINFO="name=1;rf=1
+        name=2;rf=1
+        name=3;rf=1"
+EOF
+    common_config $CONFIG
+}
+
+# Generate arbiter config
+function generate_arbiter_config() {
+    local change_cap=$1
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=0;-dc=1"
+
+NDATACENTERS=2
+
+DCINFO="name=1;rf=1;allowArbiters=true
+        name=2;rf=1"
+EOF
+    if [ "$change_cap" = "change" ]; then
+        cat >> $CONFIG <<- EOF
+CHANGE_STORAGENODE_PARAMS=" ; ;capacity=1"
+EOF
+    fi
+    common_config $CONFIG
+}
+
+# Generate basic config for rebalance
+function generate_rebalance_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=1
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=2
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=3"
+CHANGE_STORAGENODE_PARAMS="capacity=1;capacity=1;capacity=1"
+
+NDATACENTERS=3
+
+DCINFO="name=1;rf=1
+        name=2;rf=1
+        name=3;rf=1"
+EOF
+    common_config $CONFIG
+}
+
+# Generate arbiter config for rebalance
+function generate_arbiter_rebalance_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=1
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=2
+          ${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2"
+CHANGE_STORAGENODE_PARAMS="capacity=1; ;capacity=1; ;"
+
+NDATACENTERS=2
+
+DCINFO="name=1;rf=1;allowArbiters=true
+        name=2;rf=1"
+EOF
+    common_config $CONFIG
+}
+
+# Generate basic config for 1 extra SN
+function generate_extra1_config() {
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate arbiter config for 1 extra SN
+function generate_arbiter_extra1_config() {
+    local zone=$1
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=$zone"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate basic config for 3 extra SNs
+function generate_extra3_config() {
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2
+          ${ALLHOSTS[5]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=3"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate arbiter config for 2 extra SNs
+function generate_arbiter_extra2_config() {
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[4]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=2"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate basic config for splitting
+function generate_split_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+
+NDATACENTERS=1
+
+DCINFO="name=1;rf=3"
+EOF
+    common_config $CONFIG
+}
+
+# Generate arbiter config for splitting
+function generate_arbiter_split_config() {
+    local change_cap=$1
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=0;-dc=1"
+
+NDATACENTERS=1
+
+DCINFO="name=1;rf=2;allowArbiters=true"
+EOF
+    if [ "$change_cap" = "change" ]; then
+        cat >> $CONFIG <<- EOF
+CHANGE_STORAGENODE_PARAMS=" ; ; ; ; ;capacity=1"
+EOF
+    fi 
+    common_config $CONFIG
+}
+
+# Generate splitting config for change repfactor
+function generate_split_change_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[7]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+
+NDATACENTERS=1
+
+DCINFO="name=1;rf=3"
+EOF
+    common_config $CONFIG
+}
+
+# Generate splitting config for change repfactor with arbiter
+function generate_arbiter_split_change_config() {
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[7]};5000;5002;-config=config.xml;-capacity=0;-dc=1"
+
+NDATACENTERS=1
+
+DCINFO="name=1;rf=2;allowArbiters=true"
+CHANGE_STORAGENODE_PARAMS=" ; ; ; ; ; ;capacity=1"
+EOF
+    common_config $CONFIG
+}
+
+function generate_split_rebalance_config() {
+    local topo=$1
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=2;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-config=config.xml;-capacity=2;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=2;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=2;-dc=1"
+
+CHANGE_STORAGENODE_PARAMS="capacity=1;capacity=1;capacity=1;capacity=1;capacity=1;capacity=1"
+
+NDATACENTERS=1
+EOF
+    configure_dcinfo $CONFIG $topo
+    common_config $CONFIG
+}
+
+# Generate splitting config for 1 extra SN
+function generate_split_extra1_config() {
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[6]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate splitting config for 3 extra SNs
+function generate_split_extra3_config() {
+    echo "Generate extra config: $WORKDIR/extra-config"
+    EXTRA_CONFIG=$WORKDIR/extra-config
+    cat > $EXTRA_CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[6]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[7]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[8]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+EOF
+    common_extra_config $EXTRA_CONFIG
+}
+
+# Generate basic config for contract operation
+# For non-arbiter test, this can be used to contract topology from 2x3 to 1x3
+# For arbiter test, this can be used to contract topology from 3x2 to 2x2
+function generate_contract_config() {
+    local topo=$1
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[1]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[3]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+
+NDATACENTERS=1
+EOF
+    configure_dcinfo $CONFIG $topo
+    common_config $CONFIG
+}
+
+# Generate config for splitting for contract operation
+# For non-arbiter test, this can be used to contract topology from 2x3 to 1x3
+# For arbiter test, this can be used to contract topology from 3x2 to 2x2
+function generate_contract_split_config() {
+    local topo=$1
+    echo "Generate config: $WORKDIR/config"
+    CONFIG=$WORKDIR/config
+    cat > $CONFIG <<- EOF
+HOSTINFO="${ALLHOSTS[0]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[1]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[2]};5000;5002;-admin=5001;-config=config.xml;-capacity=1;-dc=1;-onlyAdmin=true
+          ${ALLHOSTS[3]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[4]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[5]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[6]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[7]};5000;5002;-config=config.xml;-capacity=1;-dc=1
+          ${ALLHOSTS[8]};5000;5002;-config=config.xml;-capacity=1;-dc=1"
+
+NDATACENTERS=1
+EOF
+    configure_dcinfo $CONFIG $topo
+    common_config $CONFIG
+}
+
+# Disconnect for a Replica from network test
+function testcase1() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure replica \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect for a Master from network test
+function testcase2() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect for a client from network test
+function testcase3() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure client \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Delay data transfering test
+function testcase4() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure delay \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Corrupt data transfering test
+function testcase5() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure corrupt \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Reorder data transfering test
+function testcase6() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure reorder \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Loss data transfering test
+function testcase7() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure loss \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect masters when killing nodes test
+function testcase8() {
+    check_hosts_num 3
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+    else
+        generate_arbiter_config
+    fi
+    echo "NODEKILL_INTERVALSECS=600" >> $CONFIG
+    echo "NODEKILL_ARGS=\"-how kill -allow-unexpected-events\"" >> $CONFIG
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -kill rn,admin \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect masters when execute change repfactor test
+function testcase9() {
+    check_hosts_num 4
+    clear_env
+    cd $DATACHECKDIR
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+        generate_extra1_config
+        bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -change-repfactor 2:2 \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    else
+        generate_arbiter_config "change"
+        generate_arbiter_extra1_config 1
+        bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -change-repfactor 1:3 \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    fi
+}
+
+# Disconnect masters when execute rebalance test
+function testcase10() {
+    check_hosts_num 6
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_rebalance_config
+        generate_extra3_config
+    else
+        generate_arbiter_rebalance_config
+        generate_arbiter_extra2_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -rebalance true \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect masters when execute redistribute test
+function testcase11() {
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        check_hosts_num 6
+        generate_config
+        generate_extra3_config
+    else
+        check_hosts_num 4
+        generate_arbiter_config "change" 
+        generate_arbiter_extra1_config 2
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -redistribute true \
+                   -networkfailure master \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect target and source SN when execute move repnode test
+function testcase12() {
+    check_hosts_num 4
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_config
+        generate_extra1_config
+    else
+        generate_arbiter_config
+        generate_arbiter_extra1_config 2
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -move-repnode rg1-rn2 \
+                   -networkfailure sn2,sn4 \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect an Admin from network test when Admins and RNs in different SNs
+function testcase13() {
+    check_hosts_num 6
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_split_config
+    else
+        generate_arbiter_split_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -networkfailure admin \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect an Admin from network test when Admins and RNs in different SNs and
+# execute changing repfactor
+function testcase14() {
+    check_hosts_num 8
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_split_change_config
+    else
+        generate_arbiter_split_change_config
+    fi
+    generate_split_extra1_config
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -change-repfactor 1:4 \
+                   -networkfailure admin \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect an Admin from network test when Admins and RNs in different SNs and
+# execute rebalancing
+function testcase15() {
+    check_hosts_num 9
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_split_rebalance_config
+    else
+        generate_split_rebalance_config "arbiter"
+    fi
+    generate_split_extra3_config
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -rebalance true \
+                   -networkfailure admin \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect an Admin from network test when Admins and RNs in different SNs and
+# execute redistribute
+function testcase16() {
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        check_hosts_num 9
+        generate_split_config
+        generate_split_extra3_config
+    else
+        check_hosts_num 7
+        generate_arbiter_split_config "change"
+        generate_split_extra1_config
+    fi
+    clear_env
+    cd $DATACHECKDIR
+    bash datacheck -scratchdir $SCRATCHDIR \
+                   -resultsdir $RESULTSDIR \
+                   -config-override $CONFIG \
+                   -extra-config-override $EXTRA_CONFIG \
+                   -redistribute true \
+                   -networkfailure admin \
+                   $FAILURE_CONFIG_OPTION \
+                   -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+}
+
+# Disconnect Replica from network test and execute contract
+function testcase17() {
+    check_hosts_num 6
+    clear_env
+    cd $DATACHECKDIR
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_contract_config
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn2,sn4,sn6 \
+                       -networkfailure replica \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    else
+        generate_contract_config "arbiter"
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn2,sn6 \
+                       -networkfailure replica \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    fi
+}
+
+# Disconnect Master from network test and execute contract
+function testcase18() {
+    check_hosts_num 6
+    clear_env
+    cd $DATACHECKDIR
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_contract_config
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn2,sn4,sn6 \
+                       -networkfailure master \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    else
+        generate_contract_config "arbiter"
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn2,sn4 \
+                       -networkfailure master \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    fi
+}
+
+# Disconnect an Admin from network test when Admins and RNs in different SNs and
+# execute contract
+function testcase19() {
+    check_hosts_num 9
+    clear_env
+    cd $DATACHECKDIR
+    if [ "$DATACHECK_ARBITER_TEST" = "false" ]; then
+        generate_contract_split_config
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn5,sn6,sn7 \
+                       -networkfailure admin \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    else
+        generate_contract_split_config "arbiter"
+        bash datacheck -scratchdir $SCRATCHDIR \
+                       -resultsdir $RESULTSDIR \
+                       -config-override $CONFIG \
+                       -contract sn5,sn6 \
+                       -networkfailure admin \
+                       $FAILURE_CONFIG_OPTION \
+                       -copylogs true 2>&1 | tee $RESULTSDIR/network-failure.log
+    fi
+}
+
+# Run test
+function run_test() {
+    local n=$1
+    local beginTime=`now`
+    echo "[$beginTime] Begin to run test case $n ..."
+    testcase$n
+    print_end_msg $n $beginTime
+    echo "-----------------------------------------------"
+    echo ""
+}
+
+# Backup results of test cases
+function backup_results() {
+    local casedir="$BACKUPDIR/testcase$1-$(date -u +'%Y%m%d%H%M%S')"
+    mkdir -p $casedir
+    cp -r $SCRATCHDIR $RESULTSDIR $casedir
+}
+
+if [ "${TEST_HOSTS}" = "" ]; then
+    echo "The flag -test_hosts is required to set"
+    exit 1
+else
+    parse_hosts_info "${TEST_HOSTS}"
+fi
+
+# Source failure config
+if [ "$FAILURE_CONFIG_OVERRIDE" != "" ]; then
+    . $FAILURE_CONFIG_OVERRIDE
+    FAILURE_CONFIG_OPTION="-failure-config-override $FAILURE_CONFIG_OVERRIDE"
+fi
+. $PROGDIR/../../standalone/stress/failure.config
+
+[ -d "$WORKDIR" ] && rm -rf "$WORKDIR"
+mkdir -p $WORKDIR
+echo "WORKDIR is: $WORKDIR"
+
+# The required number of disk space (in GB) to run the test
+AVAIL_DISK_SIZE=20
+clean_env_before_test
+
+build
+copy_jar
+
+if [ "${TEST_CASES}" != "" ]; then
+    for n in ${TEST_CASES}; do
+        run_test $n
+        backup_results $n
+    done
+else
+    check_hosts_num 9
+    for n in {1..19}; do
+        run_test $n
+        backup_results $n
+    done
+fi
